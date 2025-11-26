@@ -1,11 +1,12 @@
 import os
+import re
 import gzip
 import base64
 from flask import Flask, request
 from datetime import datetime
 from waitress import serve
 
-# === относительный путь к каталогу "requests" внутри проекта ===
+# === относительный каталог requests рядом с server.py ===
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests")
 os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -13,37 +14,57 @@ LOG_FILE = os.path.join(BASE_DIR, "incoming.log")
 
 app = Flask(__name__)
 
+# Base64 валидация
+BASE64_REGEX = re.compile(r'^[A-Za-z0-9+/=\r\n]+$')
+
 
 def log_global(text):
-    """Запись в общий лог-файл"""
+    """Записывает строку в общий лог-файл"""
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
 
 def decode_gzip_if_needed(body: bytes, headers):
-    """Раскодировать gzip если Content-Encoding=gzip"""
+    """Декодировать gzip если нужно"""
     if headers.get("Content-Encoding", "").lower() == "gzip":
         try:
             return gzip.decompress(body)
-        except Exception as e:
+        except Exception:
             return body
     return body
 
 
-def decode_base64_if_needed(text: str):
-    """Попытаться раскодировать base64"""
+def extract_and_save_jpeg(body_text, date_dir, timestamp):
+    """
+    Ищет <sourceBase64Data><![CDATA[...]]></...> и сохраняет JPEG.
+    """
+    match = re.search(
+        r"<sourceBase64Data><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
+        body_text,
+        flags=re.S
+    )
+
+    if not match:
+        return None
+
     try:
-        decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
-        if decoded.strip():
-            return decoded
+        b64data = match.group(1).replace("\n", "")
+        jpg_bytes = base64.b64decode(b64data)
+
+        jpg_path = os.path.join(date_dir, f"{timestamp}.jpg")
+        with open(jpg_path, "wb") as f:
+            f.write(jpg_bytes)
+
+        return jpg_path
+
     except Exception:
-        pass
-    return text
+        return None
 
 
-def save_request_file(path, method, headers, body_text):
-    """Сохраняем тело запроса в отдельный файл по датам"""
-
+def save_request_file(path, method, body_text):
+    """
+    Сохраняет тело запроса в XML файл в каталоге по дате.
+    """
     date_dir = os.path.join(BASE_DIR, datetime.now().strftime("%Y-%m-%d"))
     os.makedirs(date_dir, exist_ok=True)
 
@@ -55,7 +76,7 @@ def save_request_file(path, method, headers, body_text):
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(body_text)
 
-    return file_path
+    return file_path, date_dir, timestamp
 
 
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
@@ -66,37 +87,39 @@ def catch_all(path):
 
     raw_body = request.get_data()  # bytes
 
-    # Декодируем GZIP
+    # GZIP decode
     raw_body = decode_gzip_if_needed(raw_body, request.headers)
 
+    # raw → текст UTF-8
     try:
         body_text = raw_body.decode("utf-8", errors="ignore")
     except:
-        body_text = "<cannot decode>"
+        body_text = "<cannot decode UTF-8>"
 
-    # Попытка декодировать base64
-    body_text_decoded = decode_base64_if_needed(body_text)
+    # сохраняем XML
+    saved_file, date_dir, ts_short = save_request_file(path, request.method, body_text)
 
-    # Сохранение в отдельный файл
-    saved_file = save_request_file(path, request.method, request.headers, body_text_decoded)
+    # извлекаем JPEG, если есть
+    jpg_path = extract_and_save_jpeg(body_text, date_dir, ts_short)
 
-    # Запись в общий лог
+    # составление глобального лога
     log_entry = [
         "=" * 120,
         f"Time: {timestamp}",
         f"Path: /{path}",
-        f"Saved file: {saved_file}",
         f"Method: {request.method}",
-        "Headers:"
+        f"Saved XML: {saved_file}",
     ]
 
+    if jpg_path:
+        log_entry.append(f"Saved JPEG: {jpg_path}")
+
+    log_entry.append("Headers:")
     for k, v in request.headers.items():
         log_entry.append(f"  {k}: {v}")
 
     log_entry.append("Body raw:")
     log_entry.append(body_text)
-    log_entry.append("Body decoded (base64?):")
-    log_entry.append(body_text_decoded)
     log_entry.append("=" * 120)
 
     log_global("\n".join(log_entry))
