@@ -5,7 +5,8 @@ from flask import Flask, request
 from datetime import datetime
 from waitress import serve
 
-BASE_DIR = r"D:\1C\requests"
+# === относительный путь к каталогу "requests" внутри проекта ===
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests")
 os.makedirs(BASE_DIR, exist_ok=True)
 
 LOG_FILE = os.path.join(BASE_DIR, "incoming.log")
