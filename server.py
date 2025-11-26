@@ -1,6 +1,5 @@
 import os
 import re
-import gzip
 import base64
 from flask import Flask, request
 from datetime import datetime
@@ -15,24 +14,11 @@ LOG_FILE = os.path.join(BASE_DIR, "incoming.log")
 
 app = Flask(__name__)
 
-# Base64 валидация
-BASE64_REGEX = re.compile(r'^[A-Za-z0-9+/=\r\n]+$')
-
 
 def log_global(text):
     """Записывает строку в общий лог-файл"""
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(text + "\n")
-
-
-def decode_gzip_if_needed(body: bytes, headers):
-    """Декодировать gzip если нужно"""
-    if headers.get("Content-Encoding", "").lower() == "gzip":
-        try:
-            return gzip.decompress(body)
-        except Exception:
-            return body
-    return body
 
 
 def extract_and_save_jpeg(body_text, date_dir, timestamp):
@@ -66,22 +52,15 @@ def extract_and_save_jpeg(body_text, date_dir, timestamp):
         return None
 
 
-def save_request_file(path, method, body_text):
-    """
-    Сохраняет тело запроса в XML-файл в каталоге по дате.
-    """
-    date_dir = os.path.join(BASE_DIR, datetime.now().strftime("%Y-%m-%d"))
-    os.makedirs(date_dir, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%H-%M-%S_%f")
-    safe_path = path.replace("/", "_")
-
-    file_path = os.path.join(date_dir, f"{timestamp}_{method}_{safe_path}.xml")
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(body_text)
-
-    return file_path, date_dir, timestamp
+def remove_base64_from_xml(body_text):
+    """Полностью удаляет base64 блок из XML."""
+    cleaned = re.sub(
+        r"<sourceBase64Data[^>]*><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
+        "<sourceBase64Data>[image removed]</sourceBase64Data>",
+        body_text,
+        flags=re.S | re.I
+    )
+    return cleaned
 
 
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
@@ -92,7 +71,7 @@ def catch_all(path):
 
     raw_body = request.get_data()  # bytes
 
-    # NEW: пропускаем пустые тела
+    # Пропускаем пустые тела — НЕ сохраняем XML
     if not raw_body or raw_body.strip() == b"":
         log_global(
             "\n".join([
@@ -106,24 +85,29 @@ def catch_all(path):
         )
         return "<ok/>"
 
-    # Декодировать GZIP
-    raw_body = decode_gzip_if_needed(raw_body, request.headers)
-
-    # Перевод в UTF-8
+    # Переводим в текст
     try:
         body_text = raw_body.decode("utf-8", errors="ignore")
     except:
         body_text = "<cannot decode UTF-8>"
 
-    # Сохранение XML
-    saved_xml, date_dir, short_ts = save_request_file(
-        path, request.method, body_text
-    )
+    # Подготовка каталогов
+    date_dir = os.path.join(BASE_DIR, datetime.now().strftime("%Y-%m-%d"))
+    os.makedirs(date_dir, exist_ok=True)
+    short_ts = datetime.now().strftime("%H-%M-%S_%f")
 
-    # Извлечение JPEG
+    # JPEG сохраняем отдельно
     jpg_path = extract_and_save_jpeg(body_text, date_dir, short_ts)
 
-    # Лог
+    # Base64 убираем
+    body_clean = remove_base64_from_xml(body_text)
+
+    # Сохраняем XML
+    saved_xml = os.path.join(date_dir, f"{short_ts}_{request.method}_{path.replace('/', '_')}.xml")
+    with open(saved_xml, "w", encoding="utf-8") as f:
+        f.write(body_clean)
+
+    # Логирование
     log_lines = [
         "=" * 120,
         f"Time: {timestamp_now}",
@@ -139,8 +123,8 @@ def catch_all(path):
     for k, v in request.headers.items():
         log_lines.append(f"  {k}: {v}")
 
-    log_lines.append("Body raw:")
-    log_lines.append(body_text)
+    log_lines.append("Body raw (cleaned):")
+    log_lines.append(body_clean)
     log_lines.append("=" * 120)
 
     log_global("\n".join(log_lines))
