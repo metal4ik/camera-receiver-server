@@ -1,0 +1,5 @@
+requests/
+*.log
+*.jpg
+__pycache__/
+*.tmp
