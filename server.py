@@ -85,7 +85,7 @@ def save_request_file(path, method, body_text):
 
 
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
-@app.route('/<path:path>', methods=['POST', 'GET']))
+@app.route('/<path:path>', methods=['POST', 'GET'])
 def catch_all(path):
 
     timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
