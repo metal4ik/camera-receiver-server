@@ -10,6 +10,7 @@ from waitress import serve
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests")
 os.makedirs(BASE_DIR, exist_ok=True)
 
+# общий лог
 LOG_FILE = os.path.join(BASE_DIR, "incoming.log")
 
 app = Flask(__name__)
@@ -36,19 +37,23 @@ def decode_gzip_if_needed(body: bytes, headers):
 
 def extract_and_save_jpeg(body_text, date_dir, timestamp):
     """
-    Ищет <sourceBase64Data><![CDATA[...]]></...> и сохраняет JPEG.
+    Ищет Base64 JPEG внутри тега <sourceBase64Data ...><![CDATA[...]]></sourceBase64Data>
+    и сохраняет JPEG в отдельный файл.
     """
+
     match = re.search(
-        r"<sourceBase64Data><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
+        r"<sourceBase64Data[^>]*><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
         body_text,
-        flags=re.S
+        flags=re.S | re.I
     )
 
     if not match:
         return None
 
     try:
-        b64data = match.group(1).replace("\n", "")
+        b64data = match.group(1).strip()
+        b64data = b64data.replace("\n", "").replace("\r", "")
+
         jpg_bytes = base64.b64decode(b64data)
 
         jpg_path = os.path.join(date_dir, f"{timestamp}.jpg")
@@ -63,7 +68,7 @@ def extract_and_save_jpeg(body_text, date_dir, timestamp):
 
 def save_request_file(path, method, body_text):
     """
-    Сохраняет тело запроса в XML файл в каталоге по дате.
+    Сохраняет тело запроса в XML-файл в каталоге по дате.
     """
     date_dir = os.path.join(BASE_DIR, datetime.now().strftime("%Y-%m-%d"))
     os.makedirs(date_dir, exist_ok=True)
@@ -80,49 +85,65 @@ def save_request_file(path, method, body_text):
 
 
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
-@app.route('/<path:path>', methods=['POST', 'GET'])
+@app.route('/<path:path>', methods=['POST', 'GET']))
 def catch_all(path):
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     raw_body = request.get_data()  # bytes
 
-    # GZIP decode
+    # NEW: пропускаем пустые тела
+    if not raw_body or raw_body.strip() == b"":
+        log_global(
+            "\n".join([
+                "=" * 120,
+                f"Time: {timestamp_now}",
+                f"Path: /{path}",
+                f"Method: {request.method}",
+                "Body is EMPTY — XML not saved",
+                "=" * 120
+            ])
+        )
+        return "<ok/>"
+
+    # Декодировать GZIP
     raw_body = decode_gzip_if_needed(raw_body, request.headers)
 
-    # raw → текст UTF-8
+    # Перевод в UTF-8
     try:
         body_text = raw_body.decode("utf-8", errors="ignore")
     except:
         body_text = "<cannot decode UTF-8>"
 
-    # сохраняем XML
-    saved_file, date_dir, ts_short = save_request_file(path, request.method, body_text)
+    # Сохранение XML
+    saved_xml, date_dir, short_ts = save_request_file(
+        path, request.method, body_text
+    )
 
-    # извлекаем JPEG, если есть
-    jpg_path = extract_and_save_jpeg(body_text, date_dir, ts_short)
+    # Извлечение JPEG
+    jpg_path = extract_and_save_jpeg(body_text, date_dir, short_ts)
 
-    # составление глобального лога
-    log_entry = [
+    # Лог
+    log_lines = [
         "=" * 120,
-        f"Time: {timestamp}",
+        f"Time: {timestamp_now}",
         f"Path: /{path}",
         f"Method: {request.method}",
-        f"Saved XML: {saved_file}",
+        f"Saved XML: {saved_xml}",
     ]
 
     if jpg_path:
-        log_entry.append(f"Saved JPEG: {jpg_path}")
+        log_lines.append(f"Saved JPEG: {jpg_path}")
 
-    log_entry.append("Headers:")
+    log_lines.append("Headers:")
     for k, v in request.headers.items():
-        log_entry.append(f"  {k}: {v}")
+        log_lines.append(f"  {k}: {v}")
 
-    log_entry.append("Body raw:")
-    log_entry.append(body_text)
-    log_entry.append("=" * 120)
+    log_lines.append("Body raw:")
+    log_lines.append(body_text)
+    log_lines.append("=" * 120)
 
-    log_global("\n".join(log_entry))
+    log_global("\n".join(log_lines))
 
     return "<ok/>"
 
