@@ -3,3 +3,4 @@ requests/
 *.jpg
 __pycache__/
 *.tmp
+*копия*
