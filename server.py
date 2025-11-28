@@ -6,22 +6,23 @@ from flask import Flask, request
 from datetime import datetime
 from waitress import serve
 
-# === относительный каталог requests рядом с server.py ===
-BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests")
+# === Рабочая папка = каталог server.py ===
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# === Каталог хранения данных ===
+BASE_DIR = os.path.join(os.getcwd(), "requests")
 os.makedirs(BASE_DIR, exist_ok=True)
 
-# База данных
+# === Пути к файлам ===
 DB_PATH = os.path.join(BASE_DIR, "tvt.db")
-
-# общий лог
 LOG_FILE = os.path.join(BASE_DIR, "incoming.log")
 
 app = Flask(__name__)
 
 
-# ------------------------------------------
-#   БАЗА ДАННЫХ (создание таблицы)
-# ------------------------------------------
+# -------------------------------------------------------
+#               DATABASE INIT
+# -------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -49,23 +50,42 @@ def init_db():
 init_db()
 
 
-# ------------------------------------------
-#   ЛОГИ
-# ------------------------------------------
+# -------------------------------------------------------
+#                GLOBAL LOG
+# -------------------------------------------------------
 def log_global(text):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
 
-# ------------------------------------------
-#   ПАРСИНГ XML — JPEG
-# ------------------------------------------
-def extract_and_save_jpeg(body_text, date_dir, timestamp):
+# -------------------------------------------------------
+#             PARSE currentTime (tint64 → DATETIME)
+# -------------------------------------------------------
+def extract_event_time(body_text):
     """
-    Ищет Base64 JPEG внутри тега <sourceBase64Data><![CDATA[...]]>
-    и сохраняет JPEG как отдельный файл.
+    Преобразует <currentTime type="tint64">1764175218105864</currentTime>
+    → '2025-02-24 20:40:18'
     """
 
+    m = re.search(r"<currentTime[^>]*>(.*?)</currentTime>", body_text)
+    if not m:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    raw = m.group(1).strip()
+
+    try:
+        ts_micro = int(raw)                    # микросекунды
+        ts_seconds = ts_micro / 1_000_000      # → секунды
+        dt = datetime.fromtimestamp(ts_seconds)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# -------------------------------------------------------
+#                JPEG EXTRACTOR
+# -------------------------------------------------------
+def extract_and_save_jpeg(body_text, date_dir, timestamp):
     match = re.search(
         r"<sourceBase64Data[^>]*><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
         body_text,
@@ -84,14 +104,13 @@ def extract_and_save_jpeg(body_text, date_dir, timestamp):
             f.write(jpg_bytes)
 
         return jpg_path
-
-    except Exception:
+    except:
         return None
 
 
-# ------------------------------------------
-#   ОЧИСТКА XML — удаление Base64
-# ------------------------------------------
+# -------------------------------------------------------
+#               REMOVE BASE64 FROM XML
+# -------------------------------------------------------
 def remove_base64_from_xml(body_text):
     return re.sub(
         r"<sourceBase64Data[^>]*><!\[CDATA\[(.*?)\]\]></sourceBase64Data>",
@@ -101,9 +120,9 @@ def remove_base64_from_xml(body_text):
     )
 
 
-# ------------------------------------------
-#   ПАРСИНГ ОДНОГО СОБЫТИЯ (enter/leave/exist + eventId/targetId/direct)
-# ------------------------------------------
+# -------------------------------------------------------
+#         PARSE COUNTERS + EVENT INFO
+# -------------------------------------------------------
 def extract_counters_and_event_info(body_text):
 
     def get_int(tag):
@@ -130,9 +149,9 @@ def extract_counters_and_event_info(body_text):
     return counters, event_info
 
 
-# ------------------------------------------
-#   ЗАПИСЬ СОБЫТИЯ В БАЗУ
-# ------------------------------------------
+# -------------------------------------------------------
+#                   INSERT INTO SQL
+# -------------------------------------------------------
 def insert_event_to_db(event_time, path, counters, event_info, xml_file, jpg_file):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -162,34 +181,34 @@ def insert_event_to_db(event_time, path, counters, event_info, xml_file, jpg_fil
     conn.close()
 
 
-# ------------------------------------------
-#   HTTP HANDLER
-# ------------------------------------------
+# -------------------------------------------------------
+#                   HTTP HANDLER
+# -------------------------------------------------------
 @app.route('/', defaults={'path': ''}, methods=['POST', 'GET'])
 @app.route('/<path:path>', methods=['POST', 'GET'])
 def catch_all(path):
 
-    timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    raw_body = request.get_data()
 
-    raw_body = request.get_data()  # bytes
-
-    # Пустые запросы НЕ сохраняем
+    # Пустые тела не сохраняем
     if not raw_body or raw_body.strip() == b"":
         log_global("\n".join([
             "=" * 120,
-            f"Time: {timestamp_now}",
+            f"EMPTY REQUEST",
             f"Path: /{path}",
             f"Method: {request.method}",
-            "Body is EMPTY — XML not saved",
             "=" * 120
         ]))
         return "<ok/>"
 
-    # перевод в текст
+    # Текст
     try:
         body_text = raw_body.decode("utf-8", errors="ignore")
     except:
         body_text = "<cannot decode UTF-8>"
+
+    # Время по данным камеры
+    event_time = extract_event_time(body_text)
 
     # Каталог по дате
     date_dir = os.path.join(BASE_DIR, datetime.now().strftime("%Y-%m-%d"))
@@ -199,37 +218,36 @@ def catch_all(path):
     # JPEG
     jpg_path = extract_and_save_jpeg(body_text, date_dir, short_ts)
 
-    # XML без Base64
+    # XML чистим
     body_clean = remove_base64_from_xml(body_text)
 
-    # Сохранение XML
+    # Сохраняем XML
     saved_xml = os.path.join(date_dir, f"{short_ts}_{request.method}_{path.replace('/', '_')}.xml")
     with open(saved_xml, "w", encoding="utf-8") as f:
         f.write(body_clean)
 
-    # Парсим входы/выходы
+    # Извлекаем counters/eventId/etc
     counters, event_info = extract_counters_and_event_info(body_text)
 
-    # Пишем в SQL
-    insert_event_to_db(timestamp_now, path, counters, event_info, saved_xml, jpg_path)
+    # Пишем в базу
+    insert_event_to_db(event_time, path, counters, event_info, saved_xml, jpg_path)
 
-    # ЛОГ
+    # Логи
     log_lines = [
         "=" * 120,
-        f"Time: {timestamp_now}",
+        f"Camera time: {event_time}",
         f"Path: /{path}",
         f"Method: {request.method}",
-        f"Saved XML: {saved_xml}",
+        f"XML: {saved_xml}",
     ]
-
     if jpg_path:
-        log_lines.append(f"Saved JPEG: {jpg_path}")
+        log_lines.append(f"JPEG: {jpg_path}")
 
     log_lines.append("Headers:")
     for k, v in request.headers.items():
         log_lines.append(f"  {k}: {v}")
 
-    log_lines.append("Body raw (cleaned):")
+    log_lines.append("Body (cleaned):")
     log_lines.append(body_clean)
     log_lines.append("=" * 120)
 
@@ -238,9 +256,9 @@ def catch_all(path):
     return "<ok/>"
 
 
-# ------------------------------------------
-#   START SERVER
-# ------------------------------------------
+# -------------------------------------------------------
+#                   START SERVER
+# -------------------------------------------------------
 if __name__ == "__main__":
     print("SERVER STARTED: http://0.0.0.0:80")
     serve(app, host="0.0.0.0", port=80)
